@@ -33,6 +33,7 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
+import useSWR from "swr";
 import type {
   WebAgentUIMessage,
   WebAgentUIMessagePart,
@@ -74,7 +75,13 @@ import {
   shouldShowThinkingIndicator,
 } from "@/lib/chat-streaming-state";
 import { ACCEPT_IMAGE_TYPES, isValidImageType } from "@/lib/image-utils";
+import {
+  type AvailableModel,
+  DEFAULT_CONTEXT_LIMIT,
+  getModelContextLimit,
+} from "@/lib/models";
 import { DEFAULT_SANDBOX_TIMEOUT_MS } from "@/lib/sandbox/config";
+import { fetcher } from "@/lib/swr";
 import { streamdownPlugins } from "@/lib/streamdown-config";
 import { cn } from "@/lib/utils";
 import {
@@ -168,6 +175,14 @@ interface GroupedRenderMessage {
   isStreaming: boolean;
 }
 
+interface ModelsResponse {
+  models: AvailableModel[];
+}
+
+interface SessionChatContentProps {
+  initialModels: AvailableModel[];
+}
+
 function getPartIdentity(part: WebAgentUIMessagePart): string {
   if (isToolUIPart(part)) {
     return part.toolCallId ? `tool:${part.toolCallId}` : `tool:${part.type}`;
@@ -231,11 +246,13 @@ function isSandboxValid(sandboxInfo: SandboxInfo | null): boolean {
   return Date.now() < expiresAt;
 }
 
+const tokenFormatter = new Intl.NumberFormat("en-US", {
+  notation: "compact",
+  maximumFractionDigits: 1,
+});
+
 function formatTokens(tokens: number): string {
-  if (tokens >= 1000) {
-    return `${(tokens / 1000).toFixed(1)}k`;
-  }
-  return tokens.toString();
+  return tokenFormatter.format(tokens).toLowerCase();
 }
 
 function sleep(ms: number): Promise<void> {
@@ -253,7 +270,9 @@ function CircularProgress({
 }) {
   const radius = (size - strokeWidth) / 2;
   const circumference = 2 * Math.PI * radius;
-  const strokeDashoffset = circumference - (percentage / 100) * circumference;
+  const normalizedPercentage = Math.min(100, Math.max(0, percentage));
+  const strokeDashoffset =
+    circumference - (normalizedPercentage / 100) * circumference;
 
   return (
     <svg width={size} height={size} className="-rotate-90">
@@ -636,7 +655,7 @@ function ShareDialog({
   );
 }
 
-export function SessionChatContent() {
+export function SessionChatContent({ initialModels }: SessionChatContentProps) {
   const router = useRouter();
   const [input, setInput] = useState("");
   const [isCreatingSandbox, setIsCreatingSandbox] = useState(false);
@@ -767,6 +786,23 @@ export function SessionChatContent() {
     clearChatTitle,
     refreshChats,
   } = useSessionChats(session.id);
+  const hasInitialModels = initialModels.length > 0;
+  const { data: modelsData, isLoading: modelsLoading } = useSWR<ModelsResponse>(
+    "/api/models",
+    fetcher,
+    {
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      revalidateIfStale: false,
+      revalidateOnMount: !hasInitialModels,
+      fallbackData: hasInitialModels ? { models: initialModels } : undefined,
+    },
+  );
+  const models = useMemo(
+    () => modelsData?.models ?? initialModels,
+    [modelsData?.models, initialModels],
+  );
+
   const renderMessages = useMemo(
     () => (hasMounted ? messages : initialMessages),
     [hasMounted, messages, initialMessages],
@@ -1744,6 +1780,15 @@ export function SessionChatContent() {
     return { inputTokens: 0, outputTokens: 0 };
   }, [renderMessages]);
 
+  const contextLimit = useMemo(() => {
+    const modelId = chatInfo.modelId;
+    if (!modelId) {
+      return DEFAULT_CONTEXT_LIMIT;
+    }
+
+    return getModelContextLimit(modelId, models) ?? DEFAULT_CONTEXT_LIMIT;
+  }, [chatInfo.modelId, models]);
+
   // Detect pending AskUserQuestion tool calls
   const { hasPendingQuestion, pendingQuestionPart, questionToolCallId } =
     useMemo(() => {
@@ -2560,6 +2605,8 @@ export function SessionChatContent() {
                     >
                       <ModelSelectorCompact
                         value={chatInfo.modelId}
+                        models={models}
+                        isLoading={modelsLoading}
                         onChange={(modelId) => {
                           void handleModelChange(modelId);
                         }}
@@ -2572,11 +2619,10 @@ export function SessionChatContent() {
                       </span>
                     )
                   )}
-                  {/* TODO: Derive context limit from model ID instead of hardcoding */}
                   <ContextUsageIndicator
                     inputTokens={tokenUsage.inputTokens}
                     outputTokens={tokenUsage.outputTokens}
-                    contextLimit={200_000}
+                    contextLimit={contextLimit}
                   />
                 </div>
 
